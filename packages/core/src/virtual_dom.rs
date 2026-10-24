@@ -213,6 +213,12 @@ pub struct VirtualDom {
     pub(crate) resolved_scopes: Vec<ScopeId>,
 
     rx: futures_channel::mpsc::UnboundedReceiver<SchedulerMsg>,
+
+    #[cfg(debug_assertions)]
+    subsecond_handler: Option<subsecond::HotReloadRegistration>,
+
+    #[cfg(all(test, debug_assertions))]
+    subsecond_callback: Option<std::sync::Weak<dyn Fn() + Send + Sync>>,
 }
 
 impl VirtualDom {
@@ -314,6 +320,10 @@ impl VirtualDom {
             scopes: Default::default(),
             dirty_scopes: Default::default(),
             resolved_scopes: Default::default(),
+            #[cfg(debug_assertions)]
+            subsecond_handler: None,
+            #[cfg(all(test, debug_assertions))]
+            subsecond_callback: None,
         };
 
         let root = VProps::new(
@@ -768,16 +778,24 @@ impl VirtualDom {
     }
 
     #[cfg(debug_assertions)]
-    fn register_subsecond_handler(&self) {
+    fn register_subsecond_handler(&mut self) {
         let sender = self.runtime().sender.clone();
-        subsecond::register_handler(std::sync::Arc::new(move || {
+        let callback: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
             _ = sender.unbounded_send(SchedulerMsg::AllDirty);
-        }));
+        });
+        #[cfg(test)]
+        {
+            self.subsecond_callback = Some(std::sync::Arc::downgrade(&callback));
+        }
+        self.subsecond_handler = Some(subsecond::register_scoped_handler(callback));
     }
 }
 
 impl Drop for VirtualDom {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        drop(self.subsecond_handler.take());
+
         // Drop all scopes in order of height
         let mut scopes = self.scopes.drain().collect::<Vec<_>>();
         scopes.sort_by_key(|scope| scope.state().height);
@@ -805,4 +823,33 @@ async fn yield_now() {
         }
     })
     .await;
+}
+
+#[cfg(all(test, debug_assertions))]
+mod hot_reload_tests {
+    use super::*;
+    use crate::VNode;
+
+    #[test]
+    fn virtual_dom_hot_reload_marks_dirty_and_releases_sender_capture() {
+        for _ in 0..20 {
+            let mut dom = VirtualDom::new(|| Ok(VNode::empty()));
+            dom.rebuild_in_place();
+            dom.process_events();
+            assert!(!dom.has_dirty_scopes());
+            let weak = dom.subsecond_callback.as_ref().unwrap().clone();
+            let callback = weak.upgrade().unwrap();
+            callback();
+            assert!(matches!(dom.rx.try_recv(), Ok(SchedulerMsg::AllDirty)));
+            callback();
+            dom.process_events();
+            assert!(dom.has_dirty_scopes());
+            dom.render_immediate(&mut NoOpMutations);
+            assert!(!dom.has_dirty_scopes());
+            drop(callback);
+            assert!(weak.upgrade().is_some());
+            drop(dom);
+            assert!(weak.upgrade().is_none());
+        }
+    }
 }
