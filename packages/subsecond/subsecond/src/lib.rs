@@ -277,14 +277,68 @@ pub fn call<O>(mut f: impl FnMut() -> O) -> O {
 // For Dioxus purposes, this is not a big deal, but for libraries like bevy which heavily rely on
 // multithreading, it might become an issue.
 static APP_JUMP_TABLE: AtomicPtr<JumpTable> = AtomicPtr::new(std::ptr::null_mut());
-static HOTRELOAD_HANDLERS: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(Vec::new());
+static HOTRELOAD_HANDLERS: Mutex<Vec<Arc<HotReloadHandler>>> = Mutex::new(Vec::new());
+
+struct HotReloadHandler {
+    callback: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Keeps a scoped hot-reload handler registered until dropped.
+///
+/// Dropping this registration removes the handler from future patch notifications. A notification
+/// that already took a snapshot of the handlers may still call it and retain its captures until
+/// that notification finishes. Dropping the registration does not wait for in-flight callbacks.
+#[must_use = "dropping the registration unregisters the hot-reload handler"]
+pub struct HotReloadRegistration {
+    handler: Arc<HotReloadHandler>,
+}
+
+impl Drop for HotReloadRegistration {
+    fn drop(&mut self) {
+        let removed = {
+            let mut handlers = HOTRELOAD_HANDLERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            handlers
+                .iter()
+                .position(|handler| Arc::ptr_eq(handler, &self.handler))
+                .map(|index| handlers.remove(index))
+        };
+        // Captures may themselves unregister handlers when dropped.
+        drop(removed);
+    }
+}
 
 /// Register a function that will be called whenever a patch is applied.
 ///
 /// This handler will be run immediately after the patch library is loaded into the process and the
 /// JumpTable has been set.
+/// The handler remains registered for the lifetime of the process. For a handler owned by a
+/// shorter-lived runtime, use [`register_scoped_handler`].
 pub fn register_handler(handler: Arc<dyn Fn() + Send + Sync + 'static>) {
-    HOTRELOAD_HANDLERS.lock().unwrap().push(handler);
+    HOTRELOAD_HANDLERS
+        .lock()
+        .unwrap()
+        .push(Arc::new(HotReloadHandler { callback: handler }));
+}
+
+/// Register a function until the returned registration is dropped.
+///
+/// Like [`register_handler`], this runs after the patch library is loaded and its jump table is
+/// installed. Keep the registration with the runtime that owns the callback's captures.
+pub fn register_scoped_handler(
+    handler: Arc<dyn Fn() + Send + Sync + 'static>,
+) -> HotReloadRegistration {
+    let handler = Arc::new(HotReloadHandler { callback: handler });
+    HOTRELOAD_HANDLERS.lock().unwrap().push(handler.clone());
+    HotReloadRegistration { handler }
+}
+
+fn notify_hot_reload_handlers() {
+    let handlers = HOTRELOAD_HANDLERS.lock().unwrap().clone();
+    for handler in handlers {
+        (handler.callback)();
+    }
 }
 
 /// Get the current jump table, if it exists.
@@ -310,14 +364,7 @@ unsafe fn commit_patch(table: JumpTable) {
         Box::into_raw(Box::new(table)),
         std::sync::atomic::Ordering::Relaxed,
     );
-    HOTRELOAD_HANDLERS
-        .lock()
-        .unwrap()
-        .clone()
-        .iter()
-        .for_each(|handler| {
-            handler();
-        });
+    notify_hot_reload_handlers();
 }
 
 /// A panic issued by the [`call`] function if the caller would be stale if called. This causes
@@ -957,3 +1004,130 @@ impl_hot_function!(
     (Fn8Marker, A, B, C, D, E, F, G, H),
     (Fn9Marker, A, B, C, D, E, F, G, H, I)
 );
+
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    fn concurrent_notification_and_drop() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured_calls = calls.clone();
+        let resume_rx = Mutex::new(resume_rx);
+        let callback: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            captured_calls.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(()).unwrap();
+            resume_rx.lock().unwrap().recv_timeout(DEADLINE).unwrap();
+        });
+        let weak = Arc::downgrade(&callback);
+        let registration = register_scoped_handler(callback);
+        let notify = std::thread::spawn(move || {
+            notify_hot_reload_handlers();
+            finished_tx.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(DEADLINE).unwrap();
+
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let unregister = std::thread::spawn(move || {
+            drop(registration);
+            dropped_tx.send(()).unwrap();
+        });
+        dropped_rx.recv_timeout(DEADLINE).unwrap();
+        unregister.join().unwrap();
+        assert!(weak.upgrade().is_some());
+        notify_hot_reload_handlers();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        resume_tx.send(()).unwrap();
+        finished_rx.recv_timeout(DEADLINE).unwrap();
+        notify.join().unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+
+    fn captured_destructor_can_reenter_registry() {
+        struct Reenter(mpsc::Sender<()>);
+        impl Drop for Reenter {
+            fn drop(&mut self) {
+                drop(register_scoped_handler(Arc::new(|| {})));
+                self.0.send(()).unwrap();
+            }
+        }
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let capture = Reenter(dropped_tx);
+        let registration = register_scoped_handler(Arc::new(move || {
+            let _ = &capture;
+        }));
+        let worker = std::thread::spawn(move || drop(registration));
+        dropped_rx.recv_timeout(DEADLINE).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn scoped_handlers_release_captures_and_allow_reentrant_updates() {
+        concurrent_notification_and_drop();
+        captured_destructor_can_reenter_registry();
+        for _ in 0..100 {
+            let capture = Arc::new(());
+            let weak = Arc::downgrade(&capture);
+            let registration = register_scoped_handler(Arc::new(move || {
+                let _ = &capture;
+            }));
+            assert!(weak.upgrade().is_some());
+            drop(registration);
+            assert!(weak.upgrade().is_none());
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback: Arc<dyn Fn() + Send + Sync> = {
+            let calls = calls.clone();
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let first = register_scoped_handler(callback.clone());
+        let second = register_scoped_handler(callback.clone());
+        notify_hot_reload_handlers();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(first);
+        notify_hot_reload_handlers();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        let weak = Arc::downgrade(&callback);
+        drop(callback);
+        let in_flight = HOTRELOAD_HANDLERS.lock().unwrap().clone();
+        drop(second);
+        notify_hot_reload_handlers();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(weak.upgrade().is_some());
+        for handler in &in_flight {
+            (handler.callback)();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        drop(in_flight);
+        assert!(weak.upgrade().is_none());
+
+        let slot = Arc::new(Mutex::new(None));
+        let callback_slot = slot.clone();
+        let registration = register_scoped_handler(Arc::new(move || {
+            drop(callback_slot.lock().unwrap().take());
+            drop(register_scoped_handler(Arc::new(|| {})));
+        }));
+        *slot.lock().unwrap() = Some(registration);
+        notify_hot_reload_handlers();
+        assert!(slot.lock().unwrap().is_none());
+
+        let permanent_calls = Arc::new(AtomicUsize::new(0));
+        let captured_calls = permanent_calls.clone();
+        register_handler(Arc::new(move || {
+            captured_calls.fetch_add(1, Ordering::SeqCst);
+        }));
+        notify_hot_reload_handlers();
+        assert_eq!(permanent_calls.load(Ordering::SeqCst), 1);
+    }
+}
