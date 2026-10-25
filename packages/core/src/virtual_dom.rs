@@ -833,7 +833,7 @@ mod hot_reload_tests {
     #[test]
     fn virtual_dom_hot_reload_marks_dirty_and_releases_sender_capture() {
         for _ in 0..20 {
-            let mut dom = VirtualDom::new(|| Ok(VNode::empty()));
+            let mut dom = VirtualDom::new(VNode::empty);
             dom.rebuild_in_place();
             dom.process_events();
             assert!(!dom.has_dirty_scopes());
